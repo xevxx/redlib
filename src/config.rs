@@ -108,6 +108,12 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS")]
 	pub(crate) default_remove_default_feeds: Option<String>,
+
+	/// A logged-in Reddit web session used when Reddit refuses anonymous requests.
+	/// This credential must never be exposed by the instance information routes.
+	#[serde(rename = "REDLIB_REDDIT_COOKIE")]
+	#[serde(skip_serializing)]
+	pub(crate) reddit_cookie: Option<String>,
 }
 
 impl Config {
@@ -156,6 +162,7 @@ impl Config {
 			enable_rss: parse("REDLIB_ENABLE_RSS"),
 			full_url: parse("REDLIB_FULL_URL"),
 			default_remove_default_feeds: parse("REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS"),
+			reddit_cookie: parse("REDLIB_REDDIT_COOKIE"),
 		}
 	}
 }
@@ -186,6 +193,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_ENABLE_RSS" => config.enable_rss.clone(),
 		"REDLIB_FULL_URL" => config.full_url.clone(),
 		"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS" => config.default_remove_default_feeds.clone(),
+		"REDLIB_REDDIT_COOKIE" => config.reddit_cookie.clone(),
 		_ => None,
 	}
 }
@@ -270,5 +278,22 @@ mod tests {
 		write("redlib.toml", config_to_write).unwrap();
 		assert!(get_setting("REDLIB_PUSHSHIFT_FRONTEND").is_some());
 		assert_eq!(get_setting("REDLIB_PUSHSHIFT_FRONTEND"), Some("https://api.pushshift.io".into()));
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_REDDIT_COOKIE", "reddit_session=secret-cookie-value")])]
+	fn test_reddit_cookie_is_never_serialized() {
+		let config = Config::load();
+		assert_eq!(config.reddit_cookie.as_deref(), Some("reddit_session=secret-cookie-value"));
+		assert!(!serde_json::to_string(&config).unwrap().contains("secret-cookie-value"));
+		assert!(!serde_yaml::to_string(&config).unwrap().contains("secret-cookie-value"));
+	}
+
+	#[test]
+	#[sealed_test]
+	fn test_reddit_cookie_from_config_file() {
+		let config_to_write = r#"REDLIB_REDDIT_COOKIE = "reddit_session=from-file""#;
+		write("redlib.toml", config_to_write).unwrap();
+		assert_eq!(get_setting("REDLIB_REDDIT_COOKIE"), Some("reddit_session=from-file".into()));
 	}
 }

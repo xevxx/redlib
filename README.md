@@ -417,6 +417,21 @@ Assign a default value for each instance-specific setting by passing environment
 | `PORT`                    | Integer 0-65535 | `8080`                 | The **internal** port Redlib listens on.                                                                  |
 | `ENABLE_RSS`              | `["on", "off"]` | `off`                  | Enables RSS feed generation.                                                                              |
 | `FULL_URL`                | String          | (empty)                | Allows for proper URLs (for now, only needed by RSS)                                                      |
+| `REDDIT_COOKIE`           | String          | (empty)                | Logged-in reddit.com session for endpoints Reddit blocks anonymously. **Secret.** See [Reddit session](#reddit-session). |
+
+### Reddit session
+
+Reddit sometimes refuses post and comment endpoints to logged-out clients. Set `REDLIB_REDDIT_COOKIE` to a logged-in session so Redlib can retry only those blocked requests.
+
+1. Sign in to reddit.com and open your browser's developer tools.
+2. In the Network tab, reload reddit.com, select a request to `www.reddit.com`, and copy its `Cookie` request header. You can supply the complete header or just the value of its `reddit_session` cookie.
+3. Put the value in `.env` and restart Redlib:
+
+   ```dotenv
+   REDLIB_REDDIT_COOKIE="reddit_session=...; token_v2=...; ..."
+   ```
+
+The value grants access to the Reddit account, is omitted from Redlib's `/info` output, and must not be committed. If Reddit signs the session out or rotates it, replace the value and restart Redlib.
 
 ## Default user settings
 

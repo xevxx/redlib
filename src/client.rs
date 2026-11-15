@@ -1,3 +1,4 @@
+use crate::config::get_setting;
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
@@ -36,11 +37,17 @@ const SHREDDIT_PATH_PREFIX: &str = "/svc/shreddit/";
 const SHREDDIT_PARTIAL_ACCEPT: &str = "text/vnd.reddit.partial+html, text/html;q=0.9";
 // Reddit answers rate-limited shreddit requests with this reCAPTCHA page and a 200 status.
 const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</title>";
+const REDDIT_COOKIE_SETTING: &str = "REDLIB_REDDIT_COOKIE";
+const REDDIT_COOKIE_MAX_LEN: usize = 8192;
 
-// Logged-out reddit.com session shared by shreddit requests. Reddit challenges
-// cookieless clients after about ten requests, but gives each session a budget
-// of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
-static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
+// reddit.com session shared by Shreddit requests. When configured, the logged-in
+// session is seeded into the jar; otherwise Reddit supplies an anonymous session.
+// It is kept apart from the OAuth API requests on purpose.
+static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(|| {
+	let jar = Arc::new(Jar::default());
+	seed_session_cookies(&jar);
+	jar
+});
 // Leaves room for the requests already in flight when the session is rotated.
 const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 const SHREDDIT_MAX_REDIRECTS: usize = 3;
@@ -102,6 +109,100 @@ pub fn build_client() -> WreqClient {
 		.dns_resolver(RedditDnsResolver)
 		.build()
 		.expect("Should always be able to build a client")
+}
+
+/// The validated `Cookie` header of a logged-in reddit.com session.
+fn session_cookie() -> Option<String> {
+	let raw = get_setting(REDDIT_COOKIE_SETTING)?;
+	let cookie = sanitize_cookie(&raw);
+
+	if cookie.is_none() && !raw.trim().is_empty() {
+		warn!("Ignoring {REDDIT_COOKIE_SETTING}: the value is not a valid Reddit session cookie");
+	}
+
+	cookie
+}
+
+/// Normalize and validate a cookie before placing it in an HTTP header.
+/// A bare cookie value is accepted for single-account deployments.
+fn sanitize_cookie(raw: &str) -> Option<String> {
+	let cookie = raw.trim();
+	if cookie.is_empty() || cookie.len() > REDDIT_COOKIE_MAX_LEN || !cookie.is_ascii() || cookie.chars().any(char::is_control) {
+		return None;
+	}
+
+	// A single value is the common deployment case. Accept padding (`=`) in the
+	// value too; a complete Cookie header is identified by its semicolon-separated
+	// `reddit_session=...` pair below.
+	if !cookie.contains(';') && !cookie.starts_with("reddit_session=") {
+		return Some(format!("reddit_session={cookie}"));
+	}
+
+	cookie
+		.split(';')
+		.map(str::trim)
+		.any(|part| part.starts_with("reddit_session=") && part.len() > "reddit_session=".len())
+		.then(|| cookie.to_string())
+}
+
+/// Turn a non-JSON Reddit response into an actionable error rather than
+/// exposing a misleading JSON parser failure.
+fn non_json_response_error(status: u16, parse_error: &str, path: &str, session_configured: bool) -> String {
+	if status == 403 {
+		return if session_configured {
+			format!(
+				"Reddit refused this request (403 Forbidden) with {REDDIT_COOKIE_SETTING}. \
+				 The session has probably expired; replace it with a fresh cookie. | {path}"
+			)
+		} else {
+			format!(
+				"Reddit now requires a logged-in session for this endpoint. \
+				 Set {REDDIT_COOKIE_SETTING}. | {path}"
+			)
+		};
+	}
+
+	if (300..=399).contains(&status) && session_configured {
+		return format!("Reddit redirected the configured session to login. Replace {REDDIT_COOKIE_SETTING}. | {path}");
+	}
+
+	if status == 429 {
+		return format!("Reddit is rate limiting this instance (429 Too Many Requests). Try again in a minute. | {path}");
+	}
+
+	if (500..=599).contains(&status) {
+		return "Reddit is having issues, check if there's an outage".to_string();
+	}
+
+	if session_configured {
+		return format!("Reddit did not return JSON for this page (status {status}); {REDDIT_COOKIE_SETTING} may have expired. | {path}");
+	}
+
+	format!("Failed to parse page JSON data: {parse_error} | {path}")
+}
+
+/// Add the configured session to the Shreddit jar while retaining Reddit's
+/// bot-check cookies between requests.
+fn seed_session_cookies(jar: &Jar) {
+	let Some(cookie) = session_cookie() else { return };
+	for pair in cookie.split(';').map(str::trim).filter(|pair| !pair.is_empty()) {
+		jar.add(format!("{pair}; Domain=reddit.com; Path=/; Secure"), ALTERNATIVE_REDDIT_URL_BASE);
+	}
+}
+
+fn reset_shreddit_session() {
+	SHREDDIT_SESSION.clear();
+	seed_session_cookies(&SHREDDIT_SESSION);
+}
+
+/// Retry a blocked API path on reddit.com with the configured web session.
+async fn reddit_web_get(path: &str, cookie: &str) -> Result<WreqResponse, String> {
+	CLIENT
+		.get(format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}"))
+		.header(wreq_header::COOKIE, cookie)
+		.send()
+		.await
+		.map_err(|e| e.to_string())
 }
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
@@ -262,7 +363,7 @@ pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<S
 	}
 
 	warn!("Reddit rate limited the shreddit session, starting a new one");
-	SHREDDIT_SESSION.clear();
+	reset_shreddit_session();
 	shreddit_request(&path, cursor.as_deref())
 		.await?
 		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
@@ -319,6 +420,13 @@ async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<Stri
 	if status == wreq::StatusCode::TOO_MANY_REQUESTS {
 		return Ok(None);
 	}
+	if status == wreq::StatusCode::FORBIDDEN {
+		return Err(if session_cookie().is_some() {
+			format!("Reddit refused the configured session cookie (403 Forbidden). Replace {REDDIT_COOKIE_SETTING}. | {path}")
+		} else {
+			format!("Reddit now requires a logged-in session for comments. Set {REDDIT_COOKIE_SETTING}. | {path}")
+		});
+	}
 	if !status.is_success() {
 		return Err(format!("Reddit returned {status} | {path}"));
 	}
@@ -330,7 +438,7 @@ async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<Stri
 		.and_then(|value| value.parse::<f32>().ok());
 	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
 		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
-		SHREDDIT_SESSION.clear();
+		reset_shreddit_session();
 	}
 
 	let body = response.text().await.map_err(|e| format!("Failed receiving body from Reddit: {e} | {path}"))?;
@@ -520,12 +628,39 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 	#[allow(deprecated)] // try_update is newer than the project's MSRV.
 	let _ = OAUTH_RATELIMIT_REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1));
 
-	// Fetch the url...
+	let session = session_cookie();
+
+	// Fetch anonymously first so normal listing traffic does not consume the
+	// account's session budget. Retry only endpoints Reddit refuses.
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
-			let status = response.status();
+			let mut response = response;
+			let mut from_web_session = false;
 
-			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
+			// Reddit answers some logged-out JSON requests with an HTML block
+			// page. Retry only those requests against the web host with the
+			// configured session.
+			if response.status() == wreq::StatusCode::FORBIDDEN {
+				if let Some(cookie) = &session {
+					match reddit_web_get(&path, cookie).await {
+						Ok(web_response) => {
+							trace!("Retried {path} with the logged-in Reddit session: status {}", web_response.status());
+							response = web_response;
+							from_web_session = true;
+						}
+						Err(e) => warn!("Couldn't retry {path} with the logged-in Reddit session: {e}"),
+					}
+				}
+			}
+
+			let status = response.status();
+			if from_web_session && status.is_redirection() {
+				return Err(format!("Reddit redirected the configured session to login. Replace {REDDIT_COOKIE_SETTING}. | {path}"));
+			}
+
+			let reset: Option<String> = if from_web_session {
+				None
+			} else if let (Some(remaining), Some(reset), Some(used)) = (
 				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
 				response.headers().get("x-ratelimit-reset").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
 				response.headers().get("x-ratelimit-used").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
@@ -551,6 +686,10 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 					let has_remaining = body.has_remaining();
 
 					if !has_remaining {
+						if from_web_session {
+							return Err(non_json_response_error(status.as_u16(), "", &path, true));
+						}
+
 						// Rate limited, so spawn a force_refresh_token()
 						tokio::spawn(force_refresh_token());
 						return match reset {
@@ -609,11 +748,7 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 						}
 						Err(e) => {
 							error!("Got an invalid response from reddit {e}. Status code: {status}");
-							if status.is_server_error() {
-								Err("Reddit is having issues, check if there's an outage".to_string())
-							} else {
-								err("Failed to parse page JSON data", e.to_string(), path)
-							}
+							Err(non_json_response_error(status.as_u16(), &e.to_string(), &path, from_web_session || session.is_some()))
 						}
 					}
 				}
@@ -770,6 +905,56 @@ mod tests {
 		] {
 			assert_eq!(shreddit_redirect_target(location), expected, "{location}");
 		}
+	}
+
+	#[test]
+	fn test_cookie_header_is_trimmed_and_kept_intact() {
+		assert_eq!(
+			sanitize_cookie("  reddit_session=abc; token_v2=def; over18=1\n").as_deref(),
+			Some("reddit_session=abc; token_v2=def; over18=1")
+		);
+	}
+
+	#[test]
+	fn test_bare_session_value_is_normalized() {
+		assert_eq!(sanitize_cookie("  abc==  ").as_deref(), Some("reddit_session=abc=="));
+	}
+
+	#[test]
+	fn test_invalid_cookie_is_rejected() {
+		assert_eq!(sanitize_cookie(""), None);
+		assert_eq!(sanitize_cookie("token_v2=only; over18=1"), None);
+		assert_eq!(sanitize_cookie("reddit_session="), None);
+		assert_eq!(sanitize_cookie("reddit_session=abc\r\nX-Injected: yes"), None);
+		assert_eq!(sanitize_cookie("reddit_session=café"), None);
+		assert_eq!(sanitize_cookie(&"x".repeat(REDDIT_COOKIE_MAX_LEN + 1)), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_REDDIT_COOKIE", "reddit_session=secret; token_v2=second")])]
+	fn test_shreddit_jar_is_seeded_from_config() {
+		let jar = Jar::default();
+		seed_session_cookies(&jar);
+
+		let cookies = jar
+			.matches("https://www.reddit.com/svc/shreddit/comments/r/rust/t3_abc")
+			.map(|cookie| (cookie.name().to_owned(), cookie.value().to_owned()))
+			.collect::<Vec<_>>();
+		assert!(cookies.contains(&("reddit_session".into(), "secret".into())));
+		assert!(cookies.contains(&("token_v2".into(), "second".into())));
+	}
+
+	#[test]
+	fn test_non_json_errors_explain_session_failures() {
+		let missing = non_json_response_error(403, "expected value", "/comments/abc.json", false);
+		assert!(missing.contains("Set REDLIB_REDDIT_COOKIE"), "{missing}");
+
+		let expired = non_json_response_error(403, "expected value", "/comments/abc.json", true);
+		assert!(expired.contains("expired"), "{expired}");
+		assert!(!expired.contains("Set REDLIB_REDDIT_COOKIE"), "{expired}");
+
+		let login = non_json_response_error(302, "", "/comments/abc.json", true);
+		assert!(login.contains("redirected"), "{login}");
 	}
 
 	#[tokio::test]
