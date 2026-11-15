@@ -1,5 +1,5 @@
 #![allow(clippy::cmp_owned)]
-use crate::client::json;
+use crate::client::{has_reddit_session, json};
 use crate::config::get_setting;
 use crate::server::RequestExt;
 use crate::shreddit;
@@ -29,6 +29,28 @@ struct PostTemplate {
 
 static COMMENT_SEARCH_CAPTURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
 
+/// Build the original Reddit thread JSON path, preserving request parameters
+/// while applying the user's default sort and forcing unescaped response text.
+fn thread_json_path(req: &Request<Body>, sort: &str) -> String {
+	let mut query = url::form_urlencoded::Serializer::new(String::new());
+	let mut has_sort = false;
+
+	for (name, value) in url::form_urlencoded::parse(req.uri().query().unwrap_or_default().as_bytes()) {
+		if name == "raw_json" {
+			continue;
+		}
+		has_sort |= name == "sort";
+		query.append_pair(&name, &value);
+	}
+
+	if !has_sort && !sort.is_empty() {
+		query.append_pair("sort", sort);
+	}
+	query.append_pair("raw_json", "1");
+
+	format!("{}.json?{}", req.uri().path(), query.finish())
+}
+
 pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let id = req.param("id").unwrap_or_default();
 	let sub = req.param("sub").unwrap_or_default();
@@ -41,8 +63,9 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let single_thread = req.param("comment_id").is_some();
 	let highlighted_comment = &req.param("comment_id").unwrap_or_default();
 
-	// Reddit blocks the comments API for anonymous clients, so fetch the post
-	// by ID and its comments from the web frontend.
+	// Fetch post metadata by ID. Comments use Reddit's original JSON API when a
+	// logged-in session is configured, with Shreddit retained only as an
+	// anonymous fallback.
 	match json(format!("/by_id/t3_{id}.json?raw_json=1"), quarantined).await {
 		Ok(response) => {
 			let post_json = &response["data"]["children"][0];
@@ -60,9 +83,19 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				return Ok(nsfw_landing(req, req_url).await.unwrap_or_default());
 			}
 
-			let comments_json = match shreddit::comments(post.community.clone(), id, req.param("comment_id"), sort.clone(), param(&url, "context")).await {
-				Ok(comments_json) => comments_json,
-				Err(msg) => return error(req, &msg).await,
+			let comments_json = if has_reddit_session() {
+				match json(thread_json_path(&req, &sort), quarantined).await {
+					Ok(thread) => match thread.get(1) {
+						Some(comments) => comments.clone(),
+						None => return error(req, "Reddit returned an invalid comment response").await,
+					},
+					Err(msg) => return error(req, &msg).await,
+				}
+			} else {
+				match shreddit::comments(post.community.clone(), id, req.param("comment_id"), sort.clone(), param(&url, "context")).await {
+					Ok(comments_json) => comments_json,
+					Err(msg) => return error(req, &msg).await,
+				}
 			};
 
 			let query_body = match COMMENT_SEARCH_CAPTURE.captures(&url) {
@@ -100,6 +133,31 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 				error(req, &msg).await
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_thread_json_path_adds_default_sort() {
+		let req = Request::builder().uri("/r/rust/comments/abc/title/?context=3&q=hello%20world").body(Body::empty()).unwrap();
+
+		assert_eq!(
+			thread_json_path(&req, "confidence"),
+			"/r/rust/comments/abc/title/.json?context=3&q=hello+world&sort=confidence&raw_json=1"
+		);
+	}
+
+	#[test]
+	fn test_thread_json_path_preserves_explicit_sort() {
+		let req = Request::builder()
+			.uri("/r/rust/comments/abc/title/comment/?sort=new&raw_json=0")
+			.body(Body::empty())
+			.unwrap();
+
+		assert_eq!(thread_json_path(&req, "confidence"), "/r/rust/comments/abc/title/comment/.json?sort=new&raw_json=1");
 	}
 }
 

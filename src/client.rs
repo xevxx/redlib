@@ -123,6 +123,11 @@ fn session_cookie() -> Option<String> {
 	cookie
 }
 
+/// Whether a valid logged-in Reddit session is configured.
+pub(crate) fn has_reddit_session() -> bool {
+	session_cookie().is_some()
+}
+
 /// Normalize and validate a cookie before placing it in an HTTP header.
 /// A bare cookie value is accepted for single-account deployments.
 fn sanitize_cookie(raw: &str) -> Option<String> {
