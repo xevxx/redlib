@@ -39,6 +39,8 @@ const SHREDDIT_PARTIAL_ACCEPT: &str = "text/vnd.reddit.partial+html, text/html;q
 const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</title>";
 const REDDIT_COOKIE_SETTING: &str = "REDLIB_REDDIT_COOKIE";
 const REDDIT_COOKIE_MAX_LEN: usize = 8192;
+const SESSION_PROFILE: Profile = Profile::Firefox151;
+const SESSION_PLATFORM: Platform = Platform::Linux;
 
 // reddit.com session shared by Shreddit requests. When configured, the logged-in
 // session is seeded into the jar; otherwise Reddit supplies an anonymous session.
@@ -53,6 +55,7 @@ const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
 const SHREDDIT_MAX_REDIRECTS: usize = 3;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
+static SESSION_CLIENT: LazyLock<WreqClient> = LazyLock::new(build_session_client);
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	let client = block_on(Oauth::new());
@@ -100,9 +103,18 @@ pub fn build_client() -> WreqClient {
 	// a profile that Reddit is already blocking.
 	let profile = Profile::SafariIos26_2;
 	let platform = Platform::IOS;
+	info!("Building anonymous Wreq client with emulation {profile:?} on {platform:?}");
+	build_emulated_client(profile, platform)
+}
+
+fn build_session_client() -> WreqClient {
+	info!("Building Reddit session client with emulation {SESSION_PROFILE:?} on {SESSION_PLATFORM:?}");
+	build_emulated_client(SESSION_PROFILE, SESSION_PLATFORM)
+}
+
+fn build_emulated_client(profile: Profile, platform: Platform) -> WreqClient {
 	let emulation = Emulation::builder().profile(profile).platform(platform).build();
 
-	info!("Building Wreq client with emulation {profile:?} on {platform:?}");
 	WreqClient::builder()
 		.emulation(emulation)
 		.redirect(Policy::none())
@@ -202,7 +214,7 @@ fn reset_shreddit_session() {
 
 /// Retry a blocked API path on reddit.com with the configured web session.
 async fn reddit_web_get(path: &str, cookie: &str) -> Result<WreqResponse, String> {
-	CLIENT
+	SESSION_CLIENT
 		.get(format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}"))
 		.header(wreq_header::COOKIE, cookie)
 		.send()
